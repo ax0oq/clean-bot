@@ -13,12 +13,13 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import boto3
 from botocore.client import Config
 
-# =========== НАСТРОЙКИ ===========
-TOKEN = ""
-ADMIN_ID = 0
+TOKEN = "8190565498:AAGZ8kr12mv3yUuv1xZbSffo36aGRSAALDo"
+ADMIN_ID = "842148681"  # Ваш Telegram ID
+ADMIN_ID = "ax0ooo"
 
-YANDEX_ACCESS_KEY = ""
-YANDEX_SECRET_KEY = ""
+# Настройки Yandex Object Storage
+YANDEX_ACCESS_KEY = "YCAJE1DYTMfKTRDRPl7c3ftZ2"
+YANDEX_SECRET_KEY = "YCNI58o8fwJ0VGf8lCgoy-pL85UwM3Sj1NC6L6bW"
 YANDEX_BUCKET_NAME = "nogotochki1"
 YANDEX_ENDPOINT = "https://storage.yandexcloud.net"
 
