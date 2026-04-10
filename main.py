@@ -4,6 +4,7 @@ import io
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
@@ -36,8 +37,8 @@ s3_client = session.client(
 )
 
 # ========== ГЛОБАЛЬНЫЕ ДАННЫЕ ==========
-masters = {}          # {id: {"name": str, "services": [str]}}
-appointments = {}     # {id: {"user_id": int, "user_name": str, "master_id": int, "master_name": str, "service": str, "date": str, "status": str}}
+masters = {}
+appointments = {}
 next_master_id = 1
 next_appointment_id = 1
 DATA_FILE = "salon_data.json"
@@ -54,7 +55,6 @@ def load_data():
         next_appointment_id = data.get("next_appointment_id", 1)
         print(f"✅ Загружено: {len(masters)} мастеров, {len(appointments)} записей")
     except:
-        # Тестовые данные
         masters = {
             1: {"name": "Анна", "services": ["💅 Маникюр", "💅 Педикюр", "✨ Shellac"]},
             2: {"name": "Елена", "services": ["💇‍♀️ Стрижка", "🎨 Окрашивание", "✨ Укладка"]}
@@ -95,9 +95,10 @@ class MasterManagementStates(StatesGroup):
     renaming_master = State()
     editing_services = State()
 
-# ========== ИНИЦИАЛИЗАЦИЯ БОТА ==========
+# ========== ИНИЦИАЛИЗАЦИЯ БОТА С MEMORYSTORAGE ==========
+storage = MemoryStorage()
 bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
+dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
 
 # ========== КЛАВИАТУРЫ ==========
@@ -454,7 +455,6 @@ async def confirm_appointment(message: types.Message, state: FSMContext):
         }
         appointments[next_appointment_id] = new_app
         save_data()
-        # Уведомление админам
         for admin_id in ADMINS:
             try:
                 await bot.send_message(
