@@ -1,34 +1,30 @@
-import asyncio
-import sqlite3
+import os
 import json
-import uuid
-from datetime import datetime, timedelta
-from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, BaseFilter
+import io
+from datetime import datetime
+from aiogram import Bot, Dispatcher, types
+from aiogram.contrib.middlewares.logging import LoggingMiddleware
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import boto3
 from botocore.client import Config
 
-TOKEN = "8190565498:AAGZ8kr12mv3yUuv1xZbSffo36aGRSAALDo"
-ADMIN_ID = "842148681"  # Ваш Telegram ID
-ADMIN_ID = "ax0ooo"
+# ========== КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
+TOKEN = os.environ.get("8190565498:AAGZ8kr12mv3yUuv1xZbSffo36aGRSAALDo")
+ADMINS_STR = os.environ.get("ADMINS", os.environ.get("ADMIN_ID", "842148681"))
+ADMINS = [int(x.strip()) for x in ADMINS_STR.split(",") if x.strip()]
 
-# Настройки Yandex Object Storage
-YANDEX_ACCESS_KEY = "YCAJE1DYTMfKTRDRPl7c3ftZ2"
-YANDEX_SECRET_KEY = "YCNI58o8fwJ0VGf8lCgoy-pL85UwM3Sj1NC6L6bW"
-YANDEX_BUCKET_NAME = "nogotochki1"
-YANDEX_ENDPOINT = "https://storage.yandexcloud.net"
+# Yandex Cloud Storage
+YANDEX_ACCESS_KEY = os.environ.get("YCAJE1DYTMfKTRDRPl7c3ftZ2")
+YANDEX_SECRET_KEY = os.environ.get("YCNI58o8fwJ0VGf8lCgoy-pL85UwM3Sj1NC6L6bW")
+YANDEX_BUCKET_NAME = os.environ.get("YANDEX_BUCKET_NAME", "nogotochki1")
+YANDEX_ENDPOINT = os.environ.get("YANDEX_ENDPOINT", "https://storage.yandexcloud.net")
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
-scheduler = AsyncIOScheduler()
-
-# Инициализация S3 клиента для Yandex Object Storage
-s3_client = boto3.client(
+# ========== ИНИЦИАЛИЗАЦИЯ YANDEX STORAGE ==========
+session = boto3.session.Session()
+s3_client = session.client(
     's3',
     endpoint_url=YANDEX_ENDPOINT,
     aws_access_key_id=YANDEX_ACCESS_KEY,
@@ -36,649 +32,622 @@ s3_client = boto3.client(
     config=Config(signature_version='s3v4')
 )
 
-# =========== БАЗА ДАННЫХ ===========
-conn = sqlite3.connect('salon.db')
-cursor = conn.cursor()
+# ========== ХРАНИЛИЩЕ ДАННЫХ (в памяти, синхронизируется с Yandex) ==========
+masters = {}
+appointments = {}
+next_master_id = 1
+next_appointment_id = 1
 
-# Таблица записей клиентов
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS appointments (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id INTEGER,
-        username TEXT,
-        phone TEXT,
-        service TEXT,
-        master_id INTEGER DEFAULT 1,
-        datetime TEXT,
-        status TEXT,
-        file_url TEXT
-    )
-''')
+DATA_FILE = "salon_data.json"
 
-# Таблица расписания
-cursor.execute('''
-    CREATE TABLE IF NOT EXISTS work_schedule (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        time TEXT,
-        master_id INTEGER DEFAULT 1,
-        is_available INTEGER DEFAULT 1,
-        UNIQUE(date, time, master_id)
-    )
-''')
-
-# Уникальный индекс для защиты от двойных записей
-cursor.execute('''
-    CREATE UNIQUE INDEX IF NOT EXISTS unique_booking 
-    ON appointments (master_id, datetime) WHERE status = 'active'
-''')
-
-conn.commit()
-
-
-# =========== СОСТОЯНИЯ ===========
-class Booking(StatesGroup):
-    service = State()
-    date = State()
-    time = State()
-    phone = State()
-
-
-class AdminSchedule(StatesGroup):
-    action = State()
-    date = State()
-    time = State()
-
-
-# =========== ФИЛЬТР АДМИНА ===========
-class IsAdmin(BaseFilter):
-    def __init__(self, admin_ids: list[int]) -> None:
-        self.admin_ids = admin_ids
-
-    async def __call__(self, message: types.Message) -> bool:
-        return message.from_user.id in self.admin_ids
-
-
-# =========== КЛАВИАТУРЫ ===========
-main_kb = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📅 Записаться на маникюр")],
-        [KeyboardButton(text="❌ Отменить мою запись")],
-        [KeyboardButton(text="📋 Мои записи")]
-    ],
-    resize_keyboard=True
-)
-
-admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="📅 Показать расписание", callback_data="show")],
-    [InlineKeyboardButton(text="➕ Добавить слот", callback_data="add")],
-    [InlineKeyboardButton(text="❌ Удалить слот", callback_data="del")],
-    [InlineKeyboardButton(text="📊 Экспорт в JSON", callback_data="export")]
-])
-
-services_kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="💅 Маникюр + покрытие", callback_data="service_manicure")],
-    [InlineKeyboardButton(text="✂️ Коррекция + покрытие", callback_data="service_correction")],
-    [InlineKeyboardButton(text="🖐 Педикюр", callback_data="service_pedicure")],
-    [InlineKeyboardButton(text="💪 Снятие гель-лака", callback_data="service_remove")]
-])
-
-
-# =========== РАБОТА С YANDEX OBJECT STORAGE ===========
-def upload_to_yandex_storage(data: dict, filename: str = None) -> str:
-    """
-    Загружает данные в Yandex Object Storage и возвращает публичную ссылку
-    """
-    if filename is None:
-        filename = f"booking_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}.json"
-
+# ========== ФУНКЦИИ ДЛЯ РАБОТЫ С YANDEX STORAGE ==========
+def load_data_from_yandex():
+    """Загружает данные из Yandex Cloud Storage"""
+    global masters, appointments, next_master_id, next_appointment_id
+    
     try:
-        # Загружаем файл в бакет
-        s3_client.put_object(
-            Bucket=YANDEX_BUCKET_NAME,
-            Key=f"bookings/{filename}",
-            Body=json.dumps(data, ensure_ascii=False, indent=2),
-            ContentType='application/json'
-        )
-
-        # Формируем публичную ссылку
-        file_url = f"https://storage.yandexcloud.net/{YANDEX_BUCKET_NAME}/bookings/{filename}"
-        print(f"✅ Данные загружены в Object Storage: {file_url}")
-        return file_url
-    except Exception as e:
-        print(f"❌ Ошибка загрузки в Object Storage: {e}")
-        return None
-
-
-def export_all_bookings_to_json():
-    """
-    Экспортирует все записи из БД в JSON и загружает в Object Storage
-    """
-    cursor.execute('''
-        SELECT id, user_id, username, phone, service, datetime, status 
-        FROM appointments 
-        ORDER BY datetime DESC
-    ''')
-    rows = cursor.fetchall()
-
-    bookings = []
-    for row in rows:
-        bookings.append({
-            "id": row[0],
-            "user_id": row[1],
-            "username": row[2],
-            "phone": row[3],
-            "service": row[4],
-            "datetime": row[5],
-            "status": row[6]
-        })
-
-    filename = f"all_bookings_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-    return upload_to_yandex_storage({"bookings": bookings, "export_date": datetime.now().isoformat()}, filename)
-
-
-# =========== РАБОТА С БАЗОЙ ДАННЫХ ===========
-def add_work_slot(date: str, time: str, master_id: int = 1):
-    """Добавить доступный слот в расписание"""
-    try:
-        cursor.execute('''
-            INSERT OR REPLACE INTO work_schedule (date, time, master_id, is_available)
-            VALUES (?, ?, ?, 1)
-        ''', (date, time, master_id))
-        conn.commit()
+        # Пытаемся скачать файл из бакета
+        response = s3_client.get_object(Bucket=YANDEX_BUCKET_NAME, Key=DATA_FILE)
+        data = json.loads(response['Body'].read().decode('utf-8'))
+        
+        masters = {int(k): v for k, v in data.get("masters", {}).items()}
+        appointments = {int(k): v for k, v in data.get("appointments", {}).items()}
+        next_master_id = data.get("next_master_id", 1)
+        next_appointment_id = data.get("next_appointment_id", 1)
+        
+        print(f"✅ Данные загружены из Yandex Cloud: {len(masters)} мастеров, {len(appointments)} записей")
         return True
-    except:
+    except s3_client.exceptions.NoSuchKey:
+        print("📁 Файл в Yandex Cloud не найден, создаём новые данные")
+        # Создаём тестовых мастеров
+        masters = {
+            1: {"name": "Анна", "services": ["💅 Маникюр", "💅 Педикюр", "✨ Shellac"]},
+            2: {"name": "Елена", "services": ["💇‍♀️ Стрижка", "🎨 Окрашивание", "✨ Укладка"]}
+        }
+        appointments = {}
+        next_master_id = 3
+        next_appointment_id = 1
+        save_data_to_yandex()
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка загрузки из Yandex Cloud: {e}")
+        # Создаём пустые данные
+        masters = {}
+        appointments = {}
+        next_master_id = 1
+        next_appointment_id = 1
         return False
 
-
-def remove_work_slot(date: str, time: str, master_id: int = 1):
-    """Удалить слот из расписания"""
-    cursor.execute('''
-        DELETE FROM work_schedule 
-        WHERE date = ? AND time = ? AND master_id = ?
-    ''', (date, time, master_id))
-    conn.commit()
-    return cursor.rowcount > 0
-
-
-def get_available_slots(date: str, master_id: int = 1):
-    """Получить все свободные слоты на дату"""
-    cursor.execute('''
-        SELECT time FROM work_schedule 
-        WHERE date = ? AND master_id = ? AND is_available = 1
-    ''', (date, master_id))
-    scheduled = [row[0] for row in cursor.fetchall()]
-
-    available = []
-    for slot_time in scheduled:
-        cursor.execute('''
-            SELECT COUNT(*) FROM appointments 
-            WHERE master_id = ? AND datetime = ? AND status = 'active'
-        ''', (master_id, f"{date} {slot_time}:00"))
-        count = cursor.fetchone()[0]
-        if count == 0:
-            available.append(slot_time)
-    return available
-
-
-def get_all_work_dates():
-    """Получить все даты, на которые есть слоты"""
-    cursor.execute('SELECT DISTINCT date FROM work_schedule ORDER BY date')
-    return [row[0] for row in cursor.fetchall()]
-
-
-def get_slots_by_date(date: str):
-    """Получить все слоты на конкретную дату"""
-    cursor.execute('SELECT time FROM work_schedule WHERE date = ? ORDER BY time', (date,))
-    return [row[0] for row in cursor.fetchall()]
-
-
-def save_appointment(user_id, username, phone, service, datetime_str, master_id=1):
-    """Сохранить запись клиента с отправкой в Object Storage"""
-    # Проверяем, не занято ли уже это время
-    cursor.execute('''
-        SELECT COUNT(*) FROM appointments 
-        WHERE master_id = ? AND datetime = ? AND status = 'active'
-    ''', (master_id, datetime_str))
-    if cursor.fetchone()[0] > 0:
-        return None
-
-    cursor.execute('''
-        INSERT INTO appointments (user_id, username, phone, service, datetime, status, master_id)
-        VALUES (?, ?, ?, ?, ?, 'active', ?)
-    ''', (user_id, username, phone, service, datetime_str, master_id))
-    conn.commit()
-    app_id = cursor.lastrowid
-
-    # Отправляем данные в Object Storage
-    booking_data = {
-        "appointment_id": app_id,
-        "user_id": user_id,
-        "username": username,
-        "phone": phone,
-        "service": service,
-        "datetime": datetime_str,
-        "status": "active",
-        "created_at": datetime.now().isoformat()
-    }
-    file_url = upload_to_yandex_storage(booking_data)
-
-    # Обновляем запись с ссылкой на файл
-    if file_url:
-        cursor.execute('UPDATE appointments SET file_url = ? WHERE id = ?', (file_url, app_id))
-        conn.commit()
-
-    return app_id
-
-
-def cancel_appointment(user_id):
-    cursor.execute('''
-        UPDATE appointments SET status = 'cancelled' 
-        WHERE user_id = ? AND status = 'active' AND datetime > datetime('now')
-    ''', (user_id,))
-    conn.commit()
-    return cursor.rowcount > 0
-
-
-def get_active_appointments(user_id):
-    cursor.execute('''
-        SELECT id, service, datetime FROM appointments 
-        WHERE user_id = ? AND status = 'active' AND datetime > datetime('now')
-    ''', (user_id,))
-    return cursor.fetchall()
-
-
-def get_all_future_appointments():
-    cursor.execute('''
-        SELECT id, user_id, datetime, service FROM appointments 
-        WHERE status = 'active' AND datetime > datetime('now')
-    ''')
-    return cursor.fetchall()
-
-
-# =========== НАПОМИНАНИЯ ===========
-async def send_reminder(appointment_id, user_id, datetime_str, service):
-    """Отправить напоминание за 2 часа до записи"""
-    dt_obj = datetime.strptime(datetime_str, "%Y-%m-%d %H:%M:%S")
-    dt_readable = dt_obj.strftime("%d.%m.%Y в %H:%M")
-
-    text = (f"⏰ НАПОМИНАНИЕ\n\n"
-            f"Вы записаны на {service}\n"
-            f"🗓 Дата и время: {dt_readable}\n\n"
-            f"Пожалуйста, не опаздывайте. Если вы передумали, нажмите кнопку ❌ Отменить мою запись в главном меню.")
+def save_data_to_yandex():
+    """Сохраняет данные в Yandex Cloud Storage"""
     try:
-        await bot.send_message(chat_id=user_id, text=text)
-    except:
-        pass
+        data = {
+            "masters": masters,
+            "appointments": appointments,
+            "next_master_id": next_master_id,
+            "next_appointment_id": next_appointment_id,
+            "last_updated": datetime.now().isoformat()
+        }
+        
+        json_str = json.dumps(data, ensure_ascii=False, indent=2)
+        json_bytes = io.BytesIO(json_str.encode('utf-8'))
+        
+        s3_client.upload_fileobj(
+            json_bytes,
+            YANDEX_BUCKET_NAME,
+            DATA_FILE,
+            ExtraArgs={'ContentType': 'application/json'}
+        )
+        print(f"✅ Данные сохранены в Yandex Cloud: {len(masters)} мастеров, {len(appointments)} записей")
+        return True
+    except Exception as e:
+        print(f"❌ Ошибка сохранения в Yandex Cloud: {e}")
+        return False
 
+# Загружаем данные при старте
+load_data_from_yandex()
 
-def schedule_reminders():
-    """Запланировать все напоминания при запуске бота"""
-    appointments = get_all_future_appointments()
-    for app in appointments:
-        app_id, user_id, dt_str, service = app
-        app_datetime = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S")
-        remind_time = app_datetime - timedelta(hours=2)
-        now = datetime.now()
-        if remind_time > now:
-            scheduler.add_job(
-                send_reminder,
-                'date',
-                run_date=remind_time,
-                args=[app_id, user_id, dt_str, service],
-                id=f"remind_{app_id}",
-                replace_existing=True
-            )
+# ========== FSM СОСТОЯНИЯ ==========
+class AppointmentStates(StatesGroup):
+    choosing_master = State()
+    choosing_service = State()
+    entering_date = State()
+    confirming = State()
 
+class MasterManagementStates(StatesGroup):
+    entering_name = State()
+    entering_services = State()
+    renaming_master = State()
+    editing_services = State()
 
-# =========== КЛАВИАТУРЫ ДЛЯ ДАТ ===========
-def get_dates_kb():
-    """Показать только те даты, на которых есть свободные слоты"""
-    dates = get_all_work_dates()
-    if not dates:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Нет доступных дат", callback_data="no_dates")]
-        ])
-        return kb
+# ========== ИНИЦИАЛИЗАЦИЯ БОТА ==========
+storage = MemoryStorage()
+bot = Bot(token=TOKEN)
+dp = Dispatcher(bot, storage=storage)
+dp.middleware.setup(LoggingMiddleware())
 
-    kb = []
-    for date in dates:
-        available = get_available_slots(date)
-        if available:
-            try:
-                date_obj = datetime.strptime(date, "%Y-%m-%d")
-                display_date = date_obj.strftime("%d.%m (%a)")
-            except:
-                display_date = date
-            kb.append([InlineKeyboardButton(text=display_date, callback_data=f"date_{date}")])
+# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMINS
 
-    if not kb:
-        kb = [[InlineKeyboardButton(text="❌ Нет свободных слотов", callback_data="no_dates")]]
+def get_main_keyboard(user_id: int):
+    keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    keyboard.add(KeyboardButton("📅 Записаться"))
+    keyboard.add(KeyboardButton("📋 Мои записи"))
+    keyboard.add(KeyboardButton("👩‍🎨 Наши мастера"))
+    if is_admin(user_id):
+        keyboard.add(KeyboardButton("⚙️ Админ-панель"))
+    return keyboard
 
-    return InlineKeyboardMarkup(inline_keyboard=kb)
+def get_masters_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    for master_id, master in masters.items():
+        keyboard.add(InlineKeyboardButton(f"👩‍🎨 {master['name']}", callback_data=f"master_{master_id}"))
+    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main"))
+    return keyboard
 
+def get_admin_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("👥 Управление мастерами", callback_data="admin_masters"))
+    keyboard.add(InlineKeyboardButton("📊 Все записи", callback_data="admin_appointments"))
+    keyboard.add(InlineKeyboardButton("📈 Статистика", callback_data="admin_stats"))
+    keyboard.add(InlineKeyboardButton("💾 Сохранить данные", callback_data="admin_save"))
+    keyboard.add(InlineKeyboardButton("🔙 Главное меню", callback_data="back_to_main"))
+    return keyboard
 
-def get_times_kb(date: str):
-    """Показать только свободное время на выбранную дату"""
-    available_times = get_available_slots(date)
-    if not available_times:
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="❌ Нет свободного времени", callback_data="no_times")]
-        ])
-        return kb
+def get_admin_masters_keyboard():
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    for master_id, master in masters.items():
+        keyboard.add(InlineKeyboardButton(f"✏️ {master['name']}", callback_data=f"edit_master_{master_id}"))
+    keyboard.add(InlineKeyboardButton("➕ Добавить мастера", callback_data="add_master"))
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_admin"))
+    return keyboard
 
-    kb = []
-    for t in available_times:
-        kb.append([InlineKeyboardButton(text=t, callback_data=f"time_{t}")])
-    kb.append([InlineKeyboardButton(text="◀️ Назад к датам", callback_data="back_to_dates")])
+def get_edit_master_keyboard(master_id):
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(InlineKeyboardButton("✏️ Изменить имя", callback_data=f"rename_master_{master_id}"))
+    keyboard.add(InlineKeyboardButton("📋 Изменить услуги", callback_data=f"edit_services_{master_id}"))
+    keyboard.add(InlineKeyboardButton("🗑 Удалить мастера", callback_data=f"delete_master_{master_id}"))
+    keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="admin_masters"))
+    return keyboard
 
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
-# =========== ХЕНДЛЕРЫ ===========
-@dp.message(Command("start"))
+# ========== КОМАНДЫ ==========
+@dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
-    await message.answer(
-        "✨ Добро пожаловать в маникюрный салон!\n\n"
-        "Я помогу записаться и напомню о визите.\n"
-        "Используйте кнопки ниже:",
-        reply_markup=main_kb
+    welcome_text = (
+        "✨ Добро пожаловать в студию ногтевого сервиса! ✨\n\n"
+        "Я помогу вам:\n"
+        "• Записаться к мастеру\n"
+        "• Посмотреть свои записи\n"
+        "• Узнать информацию о мастерах\n\n"
+        "Используйте кнопки ниже для навигации 👇"
     )
+    await message.reply(welcome_text, reply_markup=get_main_keyboard(message.from_user.id))
 
+@dp.message_handler(commands=['help'])
+async def cmd_help(message: types.Message):
+    help_text = (
+        "📖 Доступные команды:\n"
+        "/start - начать работу\n"
+        "/help - эта справка\n"
+        "/masters - список мастеров\n"
+        "/my_appointments - мои записи\n"
+        "/cancel - отменить текущее действие"
+    )
+    await message.reply(help_text)
 
-@dp.message(F.text == "📅 Записаться на маникюр")
-async def start_booking(message: types.Message, state: FSMContext):
-    await message.answer("Выберите услугу:", reply_markup=services_kb)
-    await state.set_state(Booking.service)
+@dp.message_handler(commands=['masters'])
+async def cmd_masters(message: types.Message):
+    if not masters:
+        await message.reply("😔 Список мастеров пока пуст. Скоро они появятся!")
+        return
+    
+    text = "👩‍🎨 Наши мастера:\n\n"
+    for master_id, master in masters.items():
+        services = ", ".join(master.get("services", []))
+        text += f"• {master['name']}\n   💇 Услуги: {services}\n\n"
+    await message.reply(text)
 
+@dp.message_handler(commands=['my_appointments'])
+async def cmd_my_appointments(message: types.Message):
+    user_id = message.from_user.id
+    user_appointments = {k: v for k, v in appointments.items() if v["user_id"] == user_id}
+    
+    if not user_appointments:
+        await message.reply("📭 У вас нет записей")
+        return
+    
+    text = "📋 Ваши записи:\n\n"
+    for app_id, app in user_appointments.items():
+        master_name = masters.get(app["master_id"], {}).get("name", "Неизвестно")
+        status_emoji = "✅" if app["status"] == "confirmed" else "⏳"
+        text += f"{status_emoji} #{app_id}\n👤 Мастер: {master_name}\n💇 Услуга: {app['service']}\n📅 Дата: {app['date']}\n\n"
+    await message.reply(text)
 
-@dp.callback_query(F.data.startswith("service_"))
-async def choose_service(callback: types.CallbackQuery, state: FSMContext):
-    service_map = {
-        "service_manicure": "Маникюр + покрытие",
-        "service_correction": "Коррекция + покрытие",
-        "service_pedicure": "Педикюр",
-        "service_remove": "Снятие гель-лака"
-    }
-    service = service_map.get(callback.data)
+@dp.message_handler(commands=['cancel'], state='*')
+async def cmd_cancel(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        await message.reply("🤔 Нет активного действия для отмены")
+        return
+    await state.finish()
+    await message.reply("✅ Действие отменено", reply_markup=get_main_keyboard(message.from_user.id))
+
+# ========== ОСНОВНЫЕ КНОПКИ ==========
+@dp.message_handler(lambda message: message.text == "📅 Записаться")
+async def appointment_start(message: types.Message, state: FSMContext):
+    if not masters:
+        await message.reply("😔 К сожалению, сейчас нет доступных мастеров. Попробуйте позже!")
+        return
+    
+    await state.set_state(AppointmentStates.choosing_master)
+    await message.reply("Выберите мастера:", reply_markup=get_masters_keyboard())
+
+@dp.message_handler(lambda message: message.text == "📋 Мои записи")
+async def my_appointments_button(message: types.Message):
+    await cmd_my_appointments(message)
+
+@dp.message_handler(lambda message: message.text == "👩‍🎨 Наши мастера")
+async def masters_button(message: types.Message):
+    await cmd_masters(message)
+
+@dp.message_handler(lambda message: message.text == "⚙️ Админ-панель")
+async def admin_panel(message: types.Message):
+    if not is_admin(message.from_user.id):
+        await message.reply("⛔ У вас нет доступа к админ-панели")
+        return
+    
+    await message.reply("⚙️ Админ-панель:", reply_markup=get_admin_keyboard())
+
+# ========== INLINE CALLBACK ==========
+@dp.callback_query_handler(lambda c: c.data.startswith("master_"), state=AppointmentStates.choosing_master)
+async def process_master_selection(callback_query: types.CallbackQuery, state: FSMContext):
+    master_id = int(callback_query.data.split("_")[1])
+    master = masters.get(master_id)
+    
+    if not master:
+        await callback_query.message.edit_text("❌ Мастер не найден")
+        return
+    
+    await state.update_data(master_id=master_id, master_name=master['name'])
+    
+    services = master.get("services", [])
+    if services:
+        keyboard = InlineKeyboardMarkup(row_width=1)
+        for service in services:
+            keyboard.add(InlineKeyboardButton(service, callback_data=f"service_{master_id}_{service}"))
+        keyboard.add(InlineKeyboardButton("🔙 Назад", callback_data="back_to_masters"))
+        await state.set_state(AppointmentStates.choosing_service)
+        await callback_query.message.edit_text(f"👩‍🎨 Мастер: {master['name']}\n\nВыберите услугу:", reply_markup=keyboard)
+    else:
+        await state.set_state(AppointmentStates.entering_date)
+        await callback_query.message.edit_text(
+            f"👩‍🎨 Мастер: {master['name']}\n\n"
+            f"Введите желаемую дату и время в формате:\n"
+            f"ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
+            f"Пример: 25.04.2025 15:30"
+        )
+    
+    await callback_query.answer()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("service_"), state=AppointmentStates.choosing_service)
+async def process_service_selection(callback_query: types.CallbackQuery, state: FSMContext):
+    parts = callback_query.data.split("_")
+    service = "_".join(parts[2:])
+    
     await state.update_data(service=service)
+    await state.set_state(AppointmentStates.entering_date)
+    
+    await callback_query.message.edit_text(
+        f"✅ Вы выбрали услугу: {service}\n\n"
+        f"Теперь введите желаемую дату и время в формате:\n"
+        f"ДД.ММ.ГГГГ ЧЧ:ММ\n\n"
+        f"Пример: 25.04.2025 15:30"
+    )
+    await callback_query.answer()
 
-    dates_kb = get_dates_kb()
-    await callback.message.edit_text("Выберите удобную ДАТУ:", reply_markup=dates_kb)
-    await state.set_state(Booking.date)
-    await callback.answer()
+@dp.callback_query_handler(lambda c: c.data == "back_to_masters")
+async def back_to_masters(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(AppointmentStates.choosing_master)
+    await callback_query.message.edit_text("Выберите мастера:", reply_markup=get_masters_keyboard())
+    await callback_query.answer()
 
+@dp.callback_query_handler(lambda c: c.data == "back_to_main")
+async def back_to_main(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.finish()
+    await callback_query.message.delete()
+    await callback_query.message.answer("Главное меню:", reply_markup=get_main_keyboard(callback_query.from_user.id))
+    await callback_query.answer()
 
-@dp.callback_query(F.data.startswith("date_"), Booking.date)
-async def choose_date(callback: types.CallbackQuery, state: FSMContext):
-    date = callback.data.split("_")[1]
-    await state.update_data(date=date)
+@dp.callback_query_handler(lambda c: c.data == "back_to_admin")
+async def back_to_admin(callback_query: types.CallbackQuery):
+    await callback_query.message.edit_text("⚙️ Админ-панель:", reply_markup=get_admin_keyboard())
+    await callback_query.answer()
 
-    times_kb = get_times_kb(date)
-    await callback.message.edit_text("Выберите ВРЕМЯ:", reply_markup=times_kb)
-    await state.set_state(Booking.time)
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "back_to_dates", Booking.time)
-async def back_to_dates(callback: types.CallbackQuery, state: FSMContext):
-    dates_kb = get_dates_kb()
-    await callback.message.edit_text("Выберите удобную ДАТУ:", reply_markup=dates_kb)
-    await state.set_state(Booking.date)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("time_"), Booking.time)
-async def choose_time(callback: types.CallbackQuery, state: FSMContext):
-    time = callback.data.split("_")[1]
-    await state.update_data(time=time)
-
-    data = await state.get_data()
-    datetime_str = f"{data['date']} {time}:00"
-
-    cursor.execute('''
-        SELECT COUNT(*) FROM appointments 
-        WHERE datetime = ? AND status = 'active'
-    ''', (datetime_str,))
-    if cursor.fetchone()[0] > 0:
-        await callback.message.edit_text(
-            "❌ К сожалению, это время уже заняли.\n"
-            "Пожалуйста, выберите другое время:",
-            reply_markup=get_times_kb(data['date'])
-        )
-        await callback.answer()
+# ========== АДМИН-КОЛБЭКИ ==========
+@dp.callback_query_handler(lambda c: c.data == "admin_masters")
+async def admin_masters_menu(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет доступа", show_alert=True)
         return
+    
+    await callback_query.message.edit_text("👥 Управление мастерами:", reply_markup=get_admin_masters_keyboard())
+    await callback_query.answer()
 
-    await state.update_data(datetime_str=datetime_str)
-
-    await callback.message.edit_text(
-        f"📞 Отлично! Остался последний шаг.\n"
-        f"Напишите ваш номер телефона (например, +79991234567), чтобы мы могли связаться при отмене."
-    )
-    await state.set_state(Booking.phone)
-    await callback.answer()
-
-
-@dp.message(Booking.phone)
-async def save_phone(message: types.Message, state: FSMContext):
-    phone = message.text
-    data = await state.get_data()
-
-    app_id = save_appointment(
-        user_id=message.from_user.id,
-        username=message.from_user.username or message.from_user.full_name,
-        phone=phone,
-        service=data['service'],
-        datetime_str=data['datetime_str']
-    )
-
-    if app_id is None:
-        await message.answer(
-            "❌ К сожалению, это время только что заняли.\n"
-            "Пожалуйста, начните запись заново.",
-            reply_markup=main_kb
-        )
-        await state.clear()
+@dp.callback_query_handler(lambda c: c.data == "admin_appointments")
+async def admin_all_appointments(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет доступа", show_alert=True)
         return
+    
+    if not appointments:
+        await callback_query.message.edit_text("📭 Нет ни одной записи")
+        return
+    
+    text = "📊 ВСЕ ЗАПИСИ:\n\n"
+    for app_id, app in appointments.items():
+        master_name = masters.get(app["master_id"], {}).get("name", "Неизвестно")
+        status_emoji = "✅" if app.get("status") == "confirmed" else "⏳"
+        text += f"{status_emoji} #{app_id}\n👤 Клиент: {app['user_name']}\n👩‍🎨 Мастер: {master_name}\n💇 Услуга: {app['service']}\n📅 Дата: {app['date']}\n➖➖➖➖➖\n"
+    
+    if len(text) > 4000:
+        text = text[:4000] + "..."
+    
+    await callback_query.message.edit_text(text)
+    await callback_query.answer()
 
-    dt_obj = datetime.strptime(data['datetime_str'], "%Y-%m-%d %H:%M:%S")
-    dt_readable = dt_obj.strftime("%d.%m.%Y в %H:%M")
-
-    await message.answer(
-        f"✅ Вы успешно записаны!\n\n"
-        f"Услуга: {data['service']}\n"
-        f"Дата и время: {dt_readable}\n"
-        f"Телефон: {phone}\n\n"
-        f"Данные о записи сохранены в Yandex Cloud ☁️\n"
-        f"Я напомню вам о визите за 2 часа.\n"
-        f"Если передумаете — нажмите ❌ Отменить мою запись.",
-        reply_markup=main_kb
+@dp.callback_query_handler(lambda c: c.data == "admin_stats")
+async def admin_stats(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет доступа", show_alert=True)
+        return
+    
+    total_appointments = len(appointments)
+    confirmed = len([a for a in appointments.values() if a.get("status") == "confirmed"])
+    pending = len([a for a in appointments.values() if a.get("status") == "pending"])
+    
+    text = (
+        "📈 СТАТИСТИКА:\n\n"
+        f"👥 Всего мастеров: {len(masters)}\n"
+        f"📅 Всего записей: {total_appointments}\n"
+        f"✅ Подтверждено: {confirmed}\n"
+        f"⏳ Ожидает: {pending}\n"
     )
+    
+    await callback_query.message.edit_text(text)
+    await callback_query.answer()
 
-    remind_time = dt_obj - timedelta(hours=2)
-    if remind_time > datetime.now():
-        scheduler.add_job(
-            send_reminder,
-            'date',
-            run_date=remind_time,
-            args=[app_id, message.from_user.id, data['datetime_str'], data['service']],
-            id=f"remind_{app_id}",
-            replace_existing=True
-        )
-
-    await state.clear()
-
-
-@dp.message(F.text == "❌ Отменить мою запись")
-async def cancel_booking(message: types.Message):
-    if cancel_appointment(message.from_user.id):
-        await message.answer(
-            "❌ Ваша ближайшая запись успешно отменена.\n\nЕсли хотите — можете записаться снова через кнопку 📅",
-            reply_markup=main_kb)
+@dp.callback_query_handler(lambda c: c.data == "admin_save")
+async def admin_save_data(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет доступа", show_alert=True)
+        return
+    
+    if save_data_to_yandex():
+        await callback_query.message.edit_text("✅ Данные успешно сохранены в Yandex Cloud!")
     else:
-        await message.answer("🔍 У вас нет активных записей в будущем.", reply_markup=main_kb)
+        await callback_query.message.edit_text("❌ Ошибка сохранения в Yandex Cloud")
+    await callback_query.answer()
 
-
-@dp.message(F.text == "📋 Мои записи")
-async def show_my_bookings(message: types.Message):
-    apps = get_active_appointments(message.from_user.id)
-    if not apps:
-        await message.answer("У вас пока нет активных записей.", reply_markup=main_kb)
+# ========== УПРАВЛЕНИЕ МАСТЕРАМИ ==========
+@dp.callback_query_handler(lambda c: c.data == "add_master")
+async def add_master_start(callback_query: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет доступа", show_alert=True)
         return
+    
+    await state.set_state(MasterManagementStates.entering_name)
+    await callback_query.message.edit_text(
+        "➕ Добавление нового мастера\n\n"
+        "Введите имя мастера:"
+    )
+    await callback_query.answer()
 
-    text = "📋 Ваши активные записи:\n\n"
-    for app in apps:
-        dt_obj = datetime.strptime(app[2], "%Y-%m-%d %H:%M:%S")
-        text += f"🔹 {app[1]}\n   🗓 {dt_obj.strftime('%d.%m.%Y в %H:%M')}\n\n"
-    text += "Чтобы отменить — нажмите ❌ Отменить мою запись"
-    await message.answer(text, reply_markup=main_kb)
-
-
-# =========== АДМИН ПАНЕЛЬ ===========
-@dp.message(Command("admin"))
-async def admin_panel(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ У вас нет доступа к этой команде.")
+@dp.message_handler(state=MasterManagementStates.entering_name)
+async def add_master_name(message: types.Message, state: FSMContext):
+    global next_master_id
+    
+    name = message.text.strip()
+    if len(name) < 2:
+        await message.reply("❌ Имя слишком короткое. Попробуйте еще раз:")
         return
-    await message.answer("⚙️ Панель администратора\n\nВыберите действие:", reply_markup=admin_kb)
-    await state.set_state(AdminSchedule.action)
+    
+    await state.update_data(master_name=name)
+    await state.set_state(MasterManagementStates.entering_services)
+    await message.reply(
+        f"✅ Имя мастера: {name}\n\n"
+        f"Теперь введите список услуг через запятую\n"
+        f"Пример: маникюр, педикюр, shellac"
+    )
 
-
-@dp.callback_query(AdminSchedule.action, F.data.in_(["show", "add", "del", "export"]))
-async def admin_action(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Нет доступа", show_alert=True)
-        return
-
-    action = callback.data
-    await state.update_data(action=action)
-
-    if action == "show":
-        dates = get_all_work_dates()
-        if not dates:
-            await callback.message.edit_text("📭 Расписание пусто. Используйте '➕ Добавить слот'")
-        else:
-            text = "📅 ТЕКУЩЕЕ РАСПИСАНИЕ:\n\n"
-            for date in dates:
-                slots = get_slots_by_date(date)
-                text += f"📆 {date}: {', '.join(slots)}\n"
-            await callback.message.edit_text(text, reply_markup=admin_kb)
-
-    elif action == "export":
-        url = export_all_bookings_to_json()
-        if url:
-            await callback.message.edit_text(
-                f"✅ Данные экспортированы в Yandex Object Storage!\n\n"
-                f"📁 Ссылка на файл: {url}\n\n"
-                f"Эту ссылку можно подключить к Yandex DataLens для визуализации.",
-                reply_markup=admin_kb
-            )
-        else:
-            await callback.message.edit_text(
-                "❌ Ошибка экспорта. Проверьте настройки Object Storage.",
-                reply_markup=admin_kb
-            )
-
-    elif action == "add":
-        await callback.message.edit_text("Введите ДАТУ в формате ГГГГ-ММ-ДД (например, 2025-12-25):")
-        await state.set_state(AdminSchedule.date)
-
-    elif action == "del":
-        dates = get_all_work_dates()
-        if not dates:
-            await callback.message.edit_text("📭 Расписание пусто, нечего удалять.", reply_markup=admin_kb)
-        else:
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                                                          [InlineKeyboardButton(text=d, callback_data=f"deldate_{d}")]
-                                                          for d in dates
-                                                      ] + [[InlineKeyboardButton(text="◀️ Назад",
-                                                                                 callback_data="back_to_admin")]])
-            await callback.message.edit_text("Выберите ДАТУ для удаления:", reply_markup=kb)
-            await state.set_state(AdminSchedule.date)
-
-    await callback.answer()
-
-
-@dp.message(AdminSchedule.date)
-async def admin_add_date(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
-        return
-
-    date = message.text.strip()
+@dp.message_handler(state=MasterManagementStates.entering_services)
+async def add_master_services(message: types.Message, state: FSMContext):
+    global next_master_id
+    
+    services_text = message.text.strip()
+    services = [s.strip() for s in services_text.split(",")]
+    
     data = await state.get_data()
+    master_name = data.get("master_name")
+    
+    masters[next_master_id] = {
+        "name": master_name,
+        "services": services
+    }
+    
+    await message.reply(
+        f"✅ Мастер {master_name} добавлен!\n"
+        f"📋 Услуги: {', '.join(services)}\n\n"
+        f"ID мастера: {next_master_id}"
+    )
+    
+    next_master_id += 1
+    save_data_to_yandex()
+    await state.finish()
 
-    if data['action'] == "add":
-        try:
-            datetime.strptime(date, "%Y-%m-%d")
-        except:
-            await message.answer("❌ Неверный формат. Введите дату как ГГГГ-ММ-ДД (например, 2025-12-25):")
-            return
-
-        await state.update_data(date=date)
-        await message.answer("Введите ВРЕМЯ в формате ЧЧ:ММ (например, 14:30):")
-        await state.set_state(AdminSchedule.time)
-
-    elif data['action'] == "del":
-        cursor.execute('DELETE FROM work_schedule WHERE date = ?', (date,))
-        conn.commit()
-        await message.answer(f"✅ Все слоты на {date} удалены.", reply_markup=admin_kb)
-        await state.clear()
-
-
-@dp.message(AdminSchedule.time)
-async def admin_add_time(message: types.Message, state: FSMContext):
-    if message.from_user.id != ADMIN_ID:
+@dp.callback_query_handler(lambda c: c.data.startswith("edit_master_"))
+async def edit_master_menu(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет доступа", show_alert=True)
         return
+    
+    master_id = int(callback_query.data.split("_")[2])
+    master = masters.get(master_id)
+    
+    if not master:
+        await callback_query.message.edit_text("❌ Мастер не найден")
+        return
+    
+    await callback_query.message.edit_text(
+        f"👩‍🎨 Мастер: {master['name']}\n"
+        f"📋 Услуги: {', '.join(master.get('services', []))}\n\n"
+        f"Что хотите сделать?",
+        reply_markup=get_edit_master_keyboard(master_id)
+    )
+    await callback_query.answer()
 
-    time = message.text.strip()
+@dp.callback_query_handler(lambda c: c.data.startswith("rename_master_"))
+async def rename_master_start(callback_query: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет доступа", show_alert=True)
+        return
+    
+    master_id = int(callback_query.data.split("_")[2])
+    await state.update_data(edit_master_id=master_id)
+    await state.set_state(MasterManagementStates.renaming_master)
+    
+    await callback_query.message.edit_text(
+        f"✏️ Введите новое имя для мастера:"
+    )
+    await callback_query.answer()
+
+@dp.message_handler(state=MasterManagementStates.renaming_master)
+async def rename_master(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    date = data['date']
+    master_id = data.get("edit_master_id")
+    new_name = message.text.strip()
+    
+    if master_id in masters:
+        old_name = masters[master_id]["name"]
+        masters[master_id]["name"] = new_name
+        save_data_to_yandex()
+        await message.reply(f"✅ Имя мастера изменено с '{old_name}' на '{new_name}'")
+    else:
+        await message.reply("❌ Мастер не найден")
+    
+    await state.finish()
 
+@dp.callback_query_handler(lambda c: c.data.startswith("edit_services_"))
+async def edit_services_start(callback_query: types.CallbackQuery, state: FSMContext):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет доступа", show_alert=True)
+        return
+    
+    master_id = int(callback_query.data.split("_")[2])
+    await state.update_data(edit_master_id=master_id)
+    await state.set_state(MasterManagementStates.editing_services)
+    
+    await callback_query.message.edit_text(
+        f"✏️ Введите новый список услуг через запятую\n"
+        f"Пример: маникюр, педикюр, shellac, дизайн"
+    )
+    await callback_query.answer()
+
+@dp.message_handler(state=MasterManagementStates.editing_services)
+async def edit_services(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    master_id = data.get("edit_master_id")
+    services_text = message.text.strip()
+    services = [s.strip() for s in services_text.split(",")]
+    
+    if master_id in masters:
+        masters[master_id]["services"] = services
+        save_data_to_yandex()
+        await message.reply(f"✅ Услуги обновлены: {', '.join(services)}")
+    else:
+        await message.reply("❌ Мастер не найден")
+    
+    await state.finish()
+
+@dp.callback_query_handler(lambda c: c.data.startswith("delete_master_"))
+async def delete_master(callback_query: types.CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("⛔ Нет доступа", show_alert=True)
+        return
+    
+    master_id = int(callback_query.data.split("_")[2])
+    master_name = masters.get(master_id, {}).get("name", "Неизвестно")
+    
+    if master_id in masters:
+        del masters[master_id]
+        save_data_to_yandex()
+        await callback_query.message.edit_text(f"✅ Мастер '{master_name}' удален")
+    else:
+        await callback_query.message.edit_text("❌ Мастер не найден")
+    
+    await callback_query.answer()
+
+# ========== ОБРАБОТКА ДАТЫ ==========
+@dp.message_handler(state=AppointmentStates.entering_date)
+async def process_date(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    
+    # Проверка формата даты
     try:
-        datetime.strptime(time, "%H:%M")
-    except:
-        await message.answer("❌ Неверный формат. Введите время как ЧЧ:ММ (например, 14:30):")
-        return
+        if " " in text:
+            date_str, time_str = text.split()
+            day, month, year = map(int, date_str.split('.'))
+            hour, minute = map(int, time_str.split(':'))
+            dt = datetime(year, month, day, hour, minute)
+            
+            if dt < datetime.now():
+                await message.reply("❌ Нельзя записаться в прошлое! Введите будущую дату:")
+                return
+            
+            await state.update_data(appointment_date=text)
+            data = await state.get_data()
+            
+            confirm_text = (
+                "📝 Проверьте данные записи:\n\n"
+                f"👩‍🎨 Мастер: {data.get('master_name')}\n"
+                f"💇 Услуга: {data.get('service', 'Не указана')}\n"
+                f"📅 Дата и время: {text}\n\n"
+                f"✅ Всё верно?\n"
+                f"Напишите 'да' для подтверждения или 'нет' для отмены"
+            )
+            
+            await state.set_state(AppointmentStates.confirming)
+            await message.reply(confirm_text)
+            
+        else:
+            await message.reply("❌ Неверный формат. Используйте: ДД.ММ.ГГГГ ЧЧ:ММ\nПример: 25.04.2025 15:30")
+    except Exception as e:
+        await message.reply(f"❌ Ошибка в формате даты. Используйте: ДД.ММ.ГГГГ ЧЧ:ММ\nПример: 25.04.2025 15:30")
 
-    if add_work_slot(date, time):
-        await message.answer(
-            f"✅ Слот {date} {time} добавлен в расписание.\n\nДобавить еще? (введите время или /admin для выхода)")
-        await state.set_state(AdminSchedule.time)
+@dp.message_handler(state=AppointmentStates.confirming)
+async def confirm_appointment(message: types.Message, state: FSMContext):
+    global next_appointment_id
+    
+    if message.text.lower() == "да":
+        data = await state.get_data()
+        
+        appointment = {
+            "user_id": message.from_user.id,
+            "user_name": message.from_user.full_name,
+            "master_id": data.get("master_id"),
+            "master_name": data.get("master_name"),
+            "service": data.get("service", "Не указана"),
+            "date": data.get("appointment_date"),
+            "status": "pending",
+            "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        appointments[next_appointment_id] = appointment
+        save_data_to_yandex()  # Сохраняем в Yandex
+        
+        # Уведомляем админов
+        for admin_id in ADMINS:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    f"🔔 НОВАЯ ЗАПИСЬ!\n\n"
+                    f"👤 Клиент: {message.from_user.full_name}\n"
+                    f"🆔 ID: {message.from_user.id}\n"
+                    f"👩‍🎨 Мастер: {data.get('master_name')}\n"
+                    f"💇 Услуга: {appointment['service']}\n"
+                    f"📅 Дата: {data.get('appointment_date')}\n"
+                    f"🆔 Номер записи: #{next_appointment_id}"
+                )
+            except:
+                pass
+        
+        await message.reply(
+            f"✅ Запись создана!\n\n"
+            f"Номер записи: #{next_appointment_id}\n"
+            f"Мастер свяжется с вами для подтверждения.\n\n"
+            f"Спасибо, что выбрали нас! 💅",
+            reply_markup=get_main_keyboard(message.from_user.id)
+        )
+        
+        next_appointment_id += 1
+        await state.finish()
+        
+    elif message.text.lower() == "нет":
+        await state.finish()
+        await message.reply("❌ Запись отменена. Можете начать заново через кнопку 📅 Записаться", 
+                           reply_markup=get_main_keyboard(message.from_user.id))
     else:
-        await message.answer("❌ Ошибка при добавлении (возможно, такой слот уже существует)")
+        await message.reply("Пожалуйста, ответьте 'да' или 'нет'")
 
-
-@dp.callback_query(F.data.startswith("deldate_"))
-async def admin_delete_date(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Нет доступа")
-        return
-
-    date = callback.data.split("_")[1]
-    cursor.execute('DELETE FROM work_schedule WHERE date = ?', (date,))
-    conn.commit()
-    await callback.message.edit_text(f"✅ Все слоты на {date} удалены.", reply_markup=admin_kb)
-    await state.clear()
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "back_to_admin")
-async def back_to_admin(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id != ADMIN_ID:
-        await callback.answer("⛔ Нет доступа")
-        return
-    await callback.message.edit_text("⚙️ Панель администратора\n\nВыберите действие:", reply_markup=admin_kb)
-    await state.set_state(AdminSchedule.action)
-    await callback.answer()
-
-
-# =========== ЗАПУСК ===========
-async def main():
-    scheduler.start()
-    schedule_reminders()
-    print("✅ Бот запущен! Данные будут сохраняться в Yandex Object Storage.")
-    await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
+# ========== ЗАПУСК ==========
+if __name__ == '__main__':
+    print(f"🤖 Бот запущен!")
+    print(f"👑 Админы: {ADMINS if ADMINS else 'Не заданы!'}")
+    print(f"👩‍🎨 Мастеров в базе: {len(masters)}")
+    print(f"📅 Записей: {len(appointments)}")
+    print(f"☁️ Yandex Cloud Storage: {YANDEX_BUCKET_NAME}")
+    
+    if not ADMINS:
+        print("⚠️ ВНИМАНИЕ: Админы не заданы! Добавьте переменную ADMINS в Render")
+    
+    executor.start_polling(dp, skip_updates=True)
