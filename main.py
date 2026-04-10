@@ -1,6 +1,7 @@
 import os
 import json
 import io
+import asyncio
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
@@ -12,13 +13,13 @@ import boto3
 from botocore.client import Config
 
 # ========== КОНФИГУРАЦИЯ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
-TOKEN = os.environ.get("TOKEN")
-ADMINS_STR = os.environ.get("ADMINS", os.environ.get("ADMIN_ID", ""))
+TOKEN = os.environ.get("8190565498:AAGZ8kr12mv3yUuv1xZbSffo36aGRSAALDo")
+ADMINS_STR = os.environ.get("ADMINS", os.environ.get("ADMIN_ID", "842148681"))
 ADMINS = [int(x.strip()) for x in ADMINS_STR.split(",") if x.strip()]
 
 # Yandex Cloud Storage
-YANDEX_ACCESS_KEY = os.environ.get("YANDEX_ACCESS_KEY")
-YANDEX_SECRET_KEY = os.environ.get("YANDEX_SECRET_KEY")
+YANDEX_ACCESS_KEY = os.environ.get(YCAJE1DYTMfKTRDRPl7c3ftZ2")
+YANDEX_SECRET_KEY = os.environ.get("YCNI58o8fwJ0VGf8lCgoy-pL85UwM3Sj1NC6L6bW")
 YANDEX_BUCKET_NAME = os.environ.get("YANDEX_BUCKET_NAME", "nogotochki1")
 YANDEX_ENDPOINT = os.environ.get("YANDEX_ENDPOINT", "https://storage.yandexcloud.net")
 
@@ -537,5 +538,4 @@ async def main():
     await dp.start_polling(bot)
 
 if __name__ == '__main__':
-    import asyncio
     asyncio.run(main())
