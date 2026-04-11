@@ -11,14 +11,16 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 from aiogram.utils import executor
 import boto3
 from botocore.client import Config
+from aiohttp import web
+import asyncio
 
 # ========== КОНФИГУРАЦИЯ ==========
 TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise ValueError("TOKEN не задан")
 
-ADMINS_STR = os.environ.get("ADMINS", "")
-ADMINS = [int(x.strip()) for x in ADMINS_STR.split(",") if x.strip()]
+# Секретный код для админ-доступа (задайте свой!)
+ADMIN_SECRET_CODE = "admin123"   # <--- Смените на свой секретный код
 
 # Yandex Cloud
 YANDEX_ACCESS_KEY = os.environ.get("YANDEX_ACCESS_KEY")
@@ -95,19 +97,22 @@ class MasterManagementStates(StatesGroup):
     renaming_master = State()
     editing_services = State()
 
-# ========== ИНИЦИАЛИЗАЦИЯ БОТА С MEMORYSTORAGE ==========
+# ========== ИНИЦИАЛИЗАЦИЯ БОТА ==========
 storage = MemoryStorage()
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot, storage=storage)
 dp.middleware.setup(LoggingMiddleware())
 
+# Хранилище для сессий админа
+admin_sessions = set()
+
 # ========== КЛАВИАТУРЫ ==========
-def get_main_keyboard(user_id):
+def get_main_keyboard(is_admin=False):
     kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     kb.add(KeyboardButton("📅 Записаться"))
     kb.add(KeyboardButton("📋 Мои записи"))
     kb.add(KeyboardButton("👩‍🎨 Наши мастера"))
-    if user_id in ADMINS:
+    if is_admin:
         kb.add(KeyboardButton("⚙️ Админ-панель"))
     return kb
 
@@ -146,11 +151,12 @@ def get_edit_master_keyboard(master_id):
 # ========== КОМАНДЫ ==========
 @dp.message_handler(commands=['start'])
 async def cmd_start(message: types.Message):
+    is_admin = message.from_user.id in admin_sessions
     await message.reply(
-        "✨ Добро пожаловать в студию!\n\n"
-        "Я помогу записаться к мастеру, посмотреть записи и многое другое.\n"
-        "Используйте кнопки ниже 👇",
-        reply_markup=get_main_keyboard(message.from_user.id)
+        "✨ Добро пожаловать в студию красоты! ✨\n\n"
+        "Я помогу вам записаться к мастеру, посмотреть ваши записи.\n"
+        "Используйте кнопки ниже.",
+        reply_markup=get_main_keyboard(is_admin)
     )
 
 @dp.message_handler(commands=['masters'])
@@ -178,7 +184,19 @@ async def cmd_my_appointments(message: types.Message):
 @dp.message_handler(commands=['cancel'], state='*')
 async def cmd_cancel(message: types.Message, state: FSMContext):
     await state.finish()
-    await message.reply("❌ Действие отменено.", reply_markup=get_main_keyboard(message.from_user.id))
+    is_admin = message.from_user.id in admin_sessions
+    await message.reply("❌ Действие отменено.", reply_markup=get_main_keyboard(is_admin))
+
+# ========== СЕКРЕТНАЯ КОМАНДА ДЛЯ АДМИН-ДОСТУПА ==========
+@dp.message_handler(commands=[ADMIN_SECRET_CODE.lstrip('/')])
+async def admin_login(message: types.Message):
+    admin_sessions.add(message.from_user.id)
+    await message.reply(
+        "✅ Вы получили права администратора!\n"
+        "Теперь в главном меню появится кнопка '⚙️ Админ-панель'.\n"
+        "Отправьте /start или нажмите любую кнопку, чтобы обновить меню.",
+        reply_markup=get_main_keyboard(is_admin=True)
+    )
 
 # ========== КНОПКИ МЕНЮ ==========
 @dp.message_handler(lambda m: m.text == "📅 Записаться")
@@ -199,10 +217,25 @@ async def masters_button(message: types.Message):
 
 @dp.message_handler(lambda m: m.text == "⚙️ Админ-панель")
 async def admin_panel(message: types.Message):
-    if message.from_user.id not in ADMINS:
-        await message.reply("⛔ Нет доступа.")
+    if message.from_user.id not in admin_sessions:
+        await message.reply("⛔ У вас нет доступа к админ-панели.\n\nЧтобы получить доступ, отправьте секретную команду, которую вы установили в коде (например, /admin123).")
         return
     await message.reply("⚙️ Админ-панель:", reply_markup=get_admin_keyboard())
+
+# ========== ПРИВЕТСТВИЕ НА ЛЮБОЕ СООБЩЕНИЕ ==========
+@dp.message_handler(state='*', content_types=types.ContentTypes.ANY)
+async def echo_welcome(message: types.Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state is None:
+        is_admin = message.from_user.id in admin_sessions
+        await message.reply(
+            "👋 Привет! Я бот студии красоты.\n"
+            "Чтобы записаться, нажмите кнопку '📅 Записаться'.\n"
+            "Для списка мастеров — '👩‍🎨 Наши мастера'.\n"
+            "Ваши записи — '📋 Мои записи'.\n\n"
+            "Если вы администратор, отправьте секретную команду (например, /admin123).",
+            reply_markup=get_main_keyboard(is_admin)
+        )
 
 # ========== INLINE CALLBACK ==========
 @dp.callback_query_handler(lambda c: c.data.startswith("master_"), state=AppointmentStates.choosing_master)
@@ -245,18 +278,22 @@ async def back_to_masters(callback: types.CallbackQuery, state: FSMContext):
 async def back_to_main(callback: types.CallbackQuery, state: FSMContext):
     await state.finish()
     await callback.message.delete()
-    await callback.message.answer("Главное меню:", reply_markup=get_main_keyboard(callback.from_user.id))
+    is_admin = callback.from_user.id in admin_sessions
+    await callback.message.answer("Главное меню:", reply_markup=get_main_keyboard(is_admin))
     await callback.answer()
 
 @dp.callback_query_handler(lambda c: c.data == "back_to_admin")
 async def back_to_admin(callback: types.CallbackQuery):
+    if callback.from_user.id not in admin_sessions:
+        await callback.answer("Нет доступа")
+        return
     await callback.message.edit_text("⚙️ Админ-панель:", reply_markup=get_admin_keyboard())
     await callback.answer()
 
 # ========== АДМИН: МАСТЕРА ==========
 @dp.callback_query_handler(lambda c: c.data == "admin_masters")
 async def admin_masters_menu(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
+    if callback.from_user.id not in admin_sessions:
         await callback.answer("Нет доступа")
         return
     await callback.message.edit_text("Управление мастерами:", reply_markup=get_admin_masters_keyboard())
@@ -264,7 +301,7 @@ async def admin_masters_menu(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "add_master")
 async def add_master_start(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMINS:
+    if callback.from_user.id not in admin_sessions:
         await callback.answer("Нет доступа")
         return
     await state.set_state(MasterManagementStates.entering_name)
@@ -295,7 +332,7 @@ async def add_master_services(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("edit_master_"))
 async def edit_master_menu(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
+    if callback.from_user.id not in admin_sessions:
         await callback.answer("Нет доступа")
         return
     master_id = int(callback.data.split("_")[2])
@@ -311,7 +348,7 @@ async def edit_master_menu(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("rename_master_"))
 async def rename_master_start(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMINS:
+    if callback.from_user.id not in admin_sessions:
         await callback.answer("Нет доступа")
         return
     master_id = int(callback.data.split("_")[2])
@@ -336,7 +373,7 @@ async def rename_master(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("edit_services_"))
 async def edit_services_start(callback: types.CallbackQuery, state: FSMContext):
-    if callback.from_user.id not in ADMINS:
+    if callback.from_user.id not in admin_sessions:
         await callback.answer("Нет доступа")
         return
     master_id = int(callback.data.split("_")[2])
@@ -360,7 +397,7 @@ async def edit_services(message: types.Message, state: FSMContext):
 
 @dp.callback_query_handler(lambda c: c.data.startswith("delete_master_"))
 async def delete_master(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
+    if callback.from_user.id not in admin_sessions:
         await callback.answer("Нет доступа")
         return
     master_id = int(callback.data.split("_")[2])
@@ -376,7 +413,7 @@ async def delete_master(callback: types.CallbackQuery):
 # ========== АДМИН: ЗАПИСИ И СТАТИСТИКА ==========
 @dp.callback_query_handler(lambda c: c.data == "admin_appointments")
 async def admin_appointments(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
+    if callback.from_user.id not in admin_sessions:
         await callback.answer("Нет доступа")
         return
     if not appointments:
@@ -392,7 +429,7 @@ async def admin_appointments(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "admin_stats")
 async def admin_stats(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
+    if callback.from_user.id not in admin_sessions:
         await callback.answer("Нет доступа")
         return
     total = len(appointments)
@@ -402,7 +439,7 @@ async def admin_stats(callback: types.CallbackQuery):
 
 @dp.callback_query_handler(lambda c: c.data == "admin_save")
 async def admin_save(callback: types.CallbackQuery):
-    if callback.from_user.id not in ADMINS:
+    if callback.from_user.id not in admin_sessions:
         await callback.answer("Нет доступа")
         return
     save_data()
@@ -455,7 +492,7 @@ async def confirm_appointment(message: types.Message, state: FSMContext):
         }
         appointments[next_appointment_id] = new_app
         save_data()
-        for admin_id in ADMINS:
+        for admin_id in admin_sessions:
             try:
                 await bot.send_message(
                     admin_id,
@@ -471,17 +508,38 @@ async def confirm_appointment(message: types.Message, state: FSMContext):
         await message.reply(
             f"✅ Запись #{next_appointment_id} создана!\n"
             f"Мастер свяжется с вами для подтверждения.",
-            reply_markup=get_main_keyboard(message.from_user.id)
+            reply_markup=get_main_keyboard(message.from_user.id in admin_sessions)
         )
         next_appointment_id += 1
         await state.finish()
     elif message.text.lower() == "нет":
         await state.finish()
-        await message.reply("❌ Запись отменена.", reply_markup=get_main_keyboard(message.from_user.id))
+        is_admin = message.from_user.id in admin_sessions
+        await message.reply("❌ Запись отменена.", reply_markup=get_main_keyboard(is_admin))
     else:
         await message.reply('Пожалуйста, ответьте "да" или "нет".')
 
-# ========== ЗАПУСК ==========
+# ========== ВЕБ-СЕРВЕР ДЛЯ HEALTHCHECK (чтобы Render не убивал) ==========
+async def health_check(request):
+    return web.Response(text="I'm alive!")
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get('/health', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get('PORT', 10000))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    print(f"🌐 Веб-сервер для healthcheck запущен на порту {port}")
+
+# ========== ЗАПУСК БОТА И ВЕБ-СЕРВЕРА ПАРАЛЛЕЛЬНО ==========
+async def main():
+    # Запускаем веб-сервер
+    await start_web_server()
+    # Запускаем бота
+    print("🤖 Бот запущен. Секретный код для админа: /" + ADMIN_SECRET_CODE)
+    await dp.start_polling()
+
 if __name__ == '__main__':
-    print(f"Бот запущен. Админы: {ADMINS}")
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())
