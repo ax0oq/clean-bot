@@ -1,4 +1,7 @@
-aiogram==2.25.1
-boto3==1.34.0
-botocore==1.34.0
-aiohttp==3.8.6
+aiogram>=3.0.0
+aiosqlite
+dateparser
+aioboto3
+pydantic>=2.0
+pydantic-settings
+aiohttp
